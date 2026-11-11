@@ -1193,13 +1193,15 @@ body::after{
     let previousMonitorStatuses = {};
     // URL deployment Web App Google Apps Script. Ganti dengan URL berakhiran /exec.
     // Contoh format: https://script.google.com/macros/s/AKfycb.../exec
-    const CBT_GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxaFaCeW3p4GH3Np9qZn5dQVfyLLEtnLe_HQXvL3PueiIMTh2e9N1u0F9DDBvMz1OY7/exec';
+    const CBT_GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycby9G2A8_qnYKZ-A-SmPzQXoGkq6AzYXUQsrHgkdN5Ui0350zCd56qBBqEVQFZYnl2kP/exec';
 
     // Lapisan kompatibilitas: mempertahankan semua pola google.script.run pada kode lama.
     // index.html tetap memakai nama fungsi backend lama; pemanggilan diteruskan melalui iframe.
     let serverMode = false;
     let cbtBridgeFrame = null;
     let cbtBridgeReady = false;
+    let cbtBridgeError = '';
+    let cbtBridgeReadyTimer = null;
     let cbtBridgeRequestNo = 0;
     const cbtBridgePending = new Map();
     const cbtBridgeQueue = [];
@@ -1212,6 +1214,10 @@ body::after{
     }
 
     function cbtBridgeCall(method, args, successHandler, failureHandler) {
+      if (cbtBridgeError) {
+        if (typeof failureHandler === 'function') failureHandler({ message: cbtBridgeError });
+        return;
+      }
       const id = 'cbt_' + Date.now() + '_' + (++cbtBridgeRequestNo);
       const timer = setTimeout(() => {
         const pending = cbtBridgePending.get(id);
@@ -1268,8 +1274,20 @@ body::after{
       window.addEventListener('message', function (event) {
         if (!cbtBridgeFrame || event.source !== cbtBridgeFrame.contentWindow) return;
         const data = event.data || {};
+        if (data.type === 'CBT_BRIDGE_ERROR') {
+          cbtBridgeError = data.error || 'Bridge Google Apps Script gagal dimulai.';
+          if (cbtBridgeReadyTimer) clearTimeout(cbtBridgeReadyTimer);
+          cbtBridgePending.forEach((pending, id) => {
+            clearTimeout(pending.timer);
+            cbtBridgePending.delete(id);
+            if (typeof pending.failure === 'function') pending.failure({ message: cbtBridgeError });
+          });
+          return;
+        }
         if (data.type === 'CBT_BRIDGE_READY') {
           cbtBridgeReady = true;
+          cbtBridgeError = '';
+          if (cbtBridgeReadyTimer) clearTimeout(cbtBridgeReadyTimer);
           while (cbtBridgeQueue.length) {
             const message = cbtBridgeQueue.shift();
             try { cbtBridgeSend(message); }
@@ -1304,7 +1322,28 @@ body::after{
       cbtBridgeFrame.tabIndex = -1;
       cbtBridgeFrame.style.cssText = 'position:absolute;width:1px;height:1px;left:-10000px;top:-10000px;border:0;opacity:0;pointer-events:none;';
       cbtBridgeFrame.src = bridgeUrl.toString();
+      cbtBridgeFrame.onerror = function () {
+        cbtBridgeError = 'Halaman API Bridge gagal dimuat. Periksa URL deployment dan akses Web App.';
+        if (cbtBridgeReadyTimer) clearTimeout(cbtBridgeReadyTimer);
+        cbtBridgePending.forEach((pending, id) => {
+          clearTimeout(pending.timer);
+          cbtBridgePending.delete(id);
+          if (typeof pending.failure === 'function') pending.failure({ message: cbtBridgeError });
+        });
+      };
       document.body.appendChild(cbtBridgeFrame);
+
+      // Jangan biarkan tombol login terus menampilkan “Memproses...” jika Bridge
+      // tidak pernah mengirim sinyal siap. Pesan ini akan diteruskan ke handler login.
+      cbtBridgeReadyTimer = setTimeout(function () {
+        if (cbtBridgeReady || cbtBridgeError) return;
+        cbtBridgeError = 'API Bridge tidak merespons dalam 15 detik. Pastikan deployment GAS terbaru sudah aktif dan URL /exec benar.';
+        cbtBridgePending.forEach((pending, id) => {
+          clearTimeout(pending.timer);
+          cbtBridgePending.delete(id);
+          if (typeof pending.failure === 'function') pending.failure({ message: cbtBridgeError });
+        });
+      }, 15000);
     }
 
     initializeCbtApiBridge();
