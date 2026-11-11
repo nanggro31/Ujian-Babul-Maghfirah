@@ -4,6 +4,67 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sistem Ujian Online SMA - V2</title>
+  <!-- ===== JEMBATAN GITHUB PAGES -> GOOGLE APPS SCRIPT =====
+       Meniru google.script.run agar seluruh kode aplikasi di bawah berjalan tanpa perubahan.
+       Ganti CBT_API_URL dengan URL Web App hasil Deploy Apps Script (berakhiran /exec). -->
+  <script>
+  (function () {
+    var CBT_API_URL = 'https://script.google.com/macros/s/AKfycby377ZMorRWaV9qZYKd1iaejQeQs7F5TeR8VSkCs_5bKSiD8o4XsPjvd-QVoU3es1wJ/exec';
+    var TIMEOUT_MS = 60000;
+    // Aman diulang bila jaringan putus (tidak membuat data ganda).
+    var RETRY_OK = {processLogin:1,apiRestoreLogin:1,apiCheckSession:1,apiAutoSave:1,apiLogout:1,verifyToken:1,
+      getAdminDashboardData:1,getAdminStudents:1,getAdminQuestions:1,getAdminExams:1,getAdminClasses:1,getAdminMonitor:1,
+      getAdminAntiCheatLogs:1,getAdminResults:1,apiExportResults:1,getStudentExams:1,getStudentDashboard:1};
+
+    function post(fn, args) {
+      var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, TIMEOUT_MS) : null;
+      return fetch(CBT_API_URL, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: {'Content-Type': 'text/plain;charset=utf-8'},   // tanpa preflight CORS
+        body: JSON.stringify({fn: fn, args: args}),
+        signal: ctrl ? ctrl.signal : undefined
+      }).then(function (r) {
+        if (!r.ok) throw new Error('Server mengembalikan status ' + r.status + '.');
+        return r.text();
+      }).then(function (t) {
+        var j;
+        try { j = JSON.parse(t); } catch (e) { throw new Error('Respons server tidak valid. Pastikan Web App di-deploy dengan akses "Siapa saja" dan URL berakhiran /exec.'); }
+        return j;
+      }).finally(function () { if (timer) clearTimeout(timer); });
+    }
+
+    function call(fn, args, ok, fail) {
+      var attempts = RETRY_OK[fn] ? 3 : 1;
+      (function run(n) {
+        post(fn, args).then(function (j) {
+          if (j && j.ok) { if (ok) ok(j.data); }
+          else { var e = new Error((j && j.error) || 'Terjadi kesalahan pada server.'); if (fail) fail(e); else console.error(fn, e); }
+        }).catch(function (err) {
+          if (n < attempts) { setTimeout(function () { run(n + 1); }, 800 * n); return; }
+          var msg = (err && err.name === 'AbortError') ? 'Waktu tunggu server habis.' :
+                    (err && err.message === 'Failed to fetch') ? 'Tidak dapat terhubung ke server. Periksa koneksi internet.' :
+                    (err && err.message) || 'Gagal terhubung ke server.';
+          var e = new Error(msg); if (fail) fail(e); else console.error(fn, e);
+        });
+      })(1);
+    }
+
+    function runner(ok, fail) {
+      return new Proxy({}, {
+        get: function (_, prop) {
+          if (prop === 'withSuccessHandler') return function (f) { return runner(f, fail); };
+          if (prop === 'withFailureHandler') return function (f) { return runner(ok, f); };
+          if (prop === 'withUserObject') return function () { return runner(ok, fail); };
+          if (typeof prop !== 'string' || prop === 'then') return undefined;
+          return function () { call(prop, Array.prototype.slice.call(arguments), ok, fail); };
+        }
+      });
+    }
+    window.google = {script: {run: runner(null, null), host: {close: function () {}, setHeight: function () {}, setWidth: function () {}}}};
+  })();
+  </script>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Amiri:wght@400;700&family=Noto+Naskh+Arabic:wght@400;700&display=swap" rel="stylesheet">
   <script defer src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
@@ -1191,162 +1252,7 @@ body::after{
     let monitorErrorShown = false, sessionCheckErrorShown = false;
     let monitorPollInt = null;
     let previousMonitorStatuses = {};
-    // URL deployment Web App Google Apps Script. Ganti dengan URL berakhiran /exec.
-    // Contoh format: https://script.google.com/macros/s/AKfycb.../exec
-    const CBT_GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxmZpAsFdDv1LAYGx4GsQvHC-HLUReHXUWbeHaHEKi0jYwInkcFHj2u4MgkGXCBmp9Z/exec';
-
-    // Lapisan kompatibilitas: mempertahankan semua pola google.script.run pada kode lama.
-    // index.html tetap memakai nama fungsi backend lama; pemanggilan diteruskan melalui iframe.
-    let serverMode = false;
-    let cbtBridgeFrame = null;
-    let cbtBridgeReady = false;
-    let cbtBridgeError = '';
-    let cbtBridgeReadyTimer = null;
-    let cbtBridgeRequestNo = 0;
-    const cbtBridgePending = new Map();
-    const cbtBridgeQueue = [];
-
-    function cbtBridgeSend(message) {
-      if (!cbtBridgeFrame || !cbtBridgeFrame.contentWindow) {
-        throw new Error('Jembatan ke server belum tersedia.');
-      }
-      cbtBridgeFrame.contentWindow.postMessage(message, '*');
-    }
-
-    function cbtBridgeCall(method, args, successHandler, failureHandler) {
-      if (cbtBridgeError) {
-        if (typeof failureHandler === 'function') failureHandler({ message: cbtBridgeError });
-        return;
-      }
-      const id = 'cbt_' + Date.now() + '_' + (++cbtBridgeRequestNo);
-      const timer = setTimeout(() => {
-        const pending = cbtBridgePending.get(id);
-        if (!pending) return;
-        cbtBridgePending.delete(id);
-        if (typeof pending.failure === 'function') {
-          pending.failure({ message: 'Waktu tunggu server habis. Periksa koneksi internet lalu coba kembali.' });
-        }
-      }, 180000);
-
-      cbtBridgePending.set(id, { success: successHandler, failure: failureHandler, timer });
-      const message = { type: 'CBT_API_CALL', id, method, args };
-      if (cbtBridgeReady) {
-        try { cbtBridgeSend(message); }
-        catch (error) {
-          clearTimeout(timer);
-          cbtBridgePending.delete(id);
-          if (typeof failureHandler === 'function') failureHandler(error);
-        }
-      } else {
-        cbtBridgeQueue.push(message);
-      }
-    }
-
-    function cbtMakeScriptRunner(successHandler, failureHandler) {
-      const runnerBase = {
-        withSuccessHandler: function (fn) { return cbtMakeScriptRunner(fn, failureHandler); },
-        withFailureHandler: function (fn) { return cbtMakeScriptRunner(successHandler, fn); }
-      };
-      return new Proxy(runnerBase, {
-        get: function (target, property) {
-          if (property in target) return target[property];
-          if (property === 'then') return undefined;
-          if (typeof property !== 'string') return undefined;
-          return function () {
-            cbtBridgeCall(property, Array.prototype.slice.call(arguments), successHandler, failureHandler);
-          };
-        }
-      });
-    }
-
-    function initializeCbtApiBridge() {
-      const configuredUrl = String(CBT_GAS_WEB_APP_URL || '').trim();
-      if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:\?.*)?$/.test(configuredUrl)) {
-        serverMode = false;
-        return;
-      }
-
-      serverMode = true;
-      window.google = window.google || {};
-      window.google.script = window.google.script || {};
-      window.google.script.run = cbtMakeScriptRunner(null, null);
-
-      window.addEventListener('message', function (event) {
-        if (!cbtBridgeFrame || event.source !== cbtBridgeFrame.contentWindow) return;
-        const data = event.data || {};
-        if (data.type === 'CBT_BRIDGE_ERROR') {
-          cbtBridgeError = data.error || 'Bridge Google Apps Script gagal dimulai.';
-          if (cbtBridgeReadyTimer) clearTimeout(cbtBridgeReadyTimer);
-          cbtBridgePending.forEach((pending, id) => {
-            clearTimeout(pending.timer);
-            cbtBridgePending.delete(id);
-            if (typeof pending.failure === 'function') pending.failure({ message: cbtBridgeError });
-          });
-          return;
-        }
-        if (data.type === 'CBT_BRIDGE_READY') {
-          cbtBridgeReady = true;
-          cbtBridgeError = '';
-          if (cbtBridgeReadyTimer) clearTimeout(cbtBridgeReadyTimer);
-          while (cbtBridgeQueue.length) {
-            const message = cbtBridgeQueue.shift();
-            try { cbtBridgeSend(message); }
-            catch (error) {
-              const pending = cbtBridgePending.get(message.id);
-              if (pending) {
-                clearTimeout(pending.timer);
-                cbtBridgePending.delete(message.id);
-                if (typeof pending.failure === 'function') pending.failure(error);
-              }
-            }
-          }
-          return;
-        }
-        if (data.type !== 'CBT_API_RESULT' || !data.id) return;
-        const pending = cbtBridgePending.get(data.id);
-        if (!pending) return;
-        clearTimeout(pending.timer);
-        cbtBridgePending.delete(data.id);
-        if (data.ok) {
-          if (typeof pending.success === 'function') pending.success(data.result);
-        } else if (typeof pending.failure === 'function') {
-          pending.failure({ message: data.error || 'Terjadi kesalahan pada server.' });
-        }
-      });
-
-      const bridgeUrl = new URL(configuredUrl);
-      bridgeUrl.searchParams.set('bridge', '1');
-      cbtBridgeFrame = document.createElement('iframe');
-      cbtBridgeFrame.title = 'Koneksi layanan aplikasi';
-      cbtBridgeFrame.setAttribute('aria-hidden', 'true');
-      cbtBridgeFrame.tabIndex = -1;
-      cbtBridgeFrame.style.cssText = 'position:absolute;width:1px;height:1px;left:-10000px;top:-10000px;border:0;opacity:0;pointer-events:none;';
-      cbtBridgeFrame.src = bridgeUrl.toString();
-      cbtBridgeFrame.onerror = function () {
-        cbtBridgeError = 'Halaman API Bridge gagal dimuat. Periksa URL deployment dan akses Web App.';
-        if (cbtBridgeReadyTimer) clearTimeout(cbtBridgeReadyTimer);
-        cbtBridgePending.forEach((pending, id) => {
-          clearTimeout(pending.timer);
-          cbtBridgePending.delete(id);
-          if (typeof pending.failure === 'function') pending.failure({ message: cbtBridgeError });
-        });
-      };
-      document.body.appendChild(cbtBridgeFrame);
-
-      // Jangan biarkan tombol login terus menampilkan “Memproses...” jika Bridge
-      // tidak pernah mengirim sinyal siap. Pesan ini akan diteruskan ke handler login.
-      cbtBridgeReadyTimer = setTimeout(function () {
-        if (cbtBridgeReady || cbtBridgeError) return;
-        cbtBridgeError = 'API Bridge tidak merespons dalam 15 detik. Pastikan deployment GAS terbaru sudah aktif dan URL /exec benar.';
-        cbtBridgePending.forEach((pending, id) => {
-          clearTimeout(pending.timer);
-          cbtBridgePending.delete(id);
-          if (typeof pending.failure === 'function') pending.failure({ message: cbtBridgeError });
-        });
-      }, 15000);
-    }
-
-    initializeCbtApiBridge();
+    let serverMode = (typeof google !== 'undefined' && google.script);
 
     // Utilities
     function showToast(msg, type='success') {
