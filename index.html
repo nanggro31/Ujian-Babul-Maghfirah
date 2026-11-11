@@ -1176,102 +1176,6 @@ body::after{
   </div>
 
   <script>
-  // KONEKSI FRONTEND GITHUB PAGES KE GOOGLE APPS SCRIPT (DIRECT BRIDGE)
-  // Ganti URL di bawah dengan URL deployment Web App Apps Script yang berakhiran /exec.
-  window.CBT_GAS_BRIDGE_URL = 'https://script.google.com/macros/s/AKfycbycjayVYYKj6S0H1mHk4ihAc5c0uVvJSqoxRfvtqQg8Xpu2v5-Ejd1EMToN1VXQP-PZ/exec';
-
-  (function () {
-    const gasUrl = String(window.CBT_GAS_BRIDGE_URL || '').trim();
-    if (!gasUrl || gasUrl.indexOf('ISI_URL_') === 0) return;
-
-    const iframe = document.createElement('iframe');
-    iframe.title = 'Koneksi layanan ujian';
-    iframe.setAttribute('aria-hidden', 'true');
-    iframe.style.cssText = 'position:absolute;width:1px;height:1px;left:-9999px;top:-9999px;border:0;';
-    const separator = gasUrl.indexOf('?') >= 0 ? '&' : '?';
-    iframe.src = gasUrl + separator + 'bridge=1&origin=' + encodeURIComponent(window.location.origin);
-    document.addEventListener('DOMContentLoaded', function () {
-      document.body.appendChild(iframe);
-    });
-
-    let bridgeReady = false;
-    let requestCounter = 0;
-    const pending = new Map();
-    const waiting = [];
-
-    function dispatch(item) {
-      if (item.timer) clearTimeout(item.timer);
-      item.timer = setTimeout(function () {
-        const wasPending = pending.has(item.id);
-        if (wasPending) pending.delete(item.id);
-        const waitingIndex = waiting.findIndex(function (queued) { return queued.id === item.id; });
-        if (waitingIndex >= 0) waiting.splice(waitingIndex, 1);
-        if ((wasPending || waitingIndex >= 0) && typeof item.failure === 'function') {
-          item.failure(new Error('Koneksi ke Google Apps Script belum merespons. Periksa URL deployment dan akses Web App.'));
-        }
-      }, 30000);
-
-      if (!bridgeReady || !iframe.contentWindow) {
-        waiting.push(item);
-        return;
-      }
-      pending.set(item.id, item);
-      iframe.contentWindow.postMessage({
-        type: 'cbt-request',
-        id: item.id,
-        method: item.method,
-        args: item.args
-      }, '*');
-    }
-
-    window.addEventListener('message', function (event) {
-      if (!iframe.contentWindow || event.source !== iframe.contentWindow) return;
-      const data = event.data || {};
-      if (data.type === 'cbt-bridge-ready') {
-        bridgeReady = true;
-        while (waiting.length) dispatch(waiting.shift());
-        return;
-      }
-      if (data.type !== 'cbt-response') return;
-      const item = pending.get(data.id);
-      if (!item) return;
-      pending.delete(data.id);
-      if (item.timer) clearTimeout(item.timer);
-      if (data.ok) {
-        if (typeof item.success === 'function') item.success(data.result);
-      } else {
-        const err = new Error(data.error || 'Terjadi kesalahan pada server Apps Script.');
-        if (typeof item.failure === 'function') item.failure(err);
-        else console.error(err);
-      }
-    });
-
-    function makeRunner(success, failure) {
-      const target = {
-        withSuccessHandler: function (fn) { return makeRunner(fn, failure); },
-        withFailureHandler: function (fn) { return makeRunner(success, fn); }
-      };
-      return new Proxy(target, {
-        get: function (obj, prop) {
-          if (prop in obj) return obj[prop];
-          if (typeof prop !== 'string' || prop === 'then') return undefined;
-          return function () {
-            const args = Array.prototype.slice.call(arguments);
-            const id = 'cbt_' + (++requestCounter) + '_' + Date.now();
-            dispatch({ id: id, method: prop, args: args, success: success, failure: failure });
-          };
-        }
-      });
-    }
-
-    window.google = window.google || {};
-    window.google.script = window.google.script || {};
-    window.google.script.run = makeRunner(null, null);
-    window.CBT_BRIDGE_CONNECTED = true;
-  })();
-</script>
-
-<script>
     let currentUser = null;
     let authToken = null;
     let pendingRestoredSession = null;
@@ -1287,7 +1191,123 @@ body::after{
     let monitorErrorShown = false, sessionCheckErrorShown = false;
     let monitorPollInt = null;
     let previousMonitorStatuses = {};
-    let serverMode = (typeof google !== 'undefined' && google.script);
+    // URL deployment Web App Google Apps Script. Ganti dengan URL berakhiran /exec.
+    // Contoh format: https://script.google.com/macros/s/AKfycb.../exec
+    const CBT_GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbyay35Rzlp9v-sjGuCQxr_3CkRt3Rog5MCIUUJxNjmfEcZfj3QZAOEBf6pkCuRJbPkX/exec';
+
+    // Lapisan kompatibilitas: mempertahankan semua pola google.script.run pada kode lama.
+    // index.html tetap memakai nama fungsi backend lama; pemanggilan diteruskan melalui iframe.
+    let serverMode = false;
+    let cbtBridgeFrame = null;
+    let cbtBridgeReady = false;
+    let cbtBridgeRequestNo = 0;
+    const cbtBridgePending = new Map();
+    const cbtBridgeQueue = [];
+
+    function cbtBridgeSend(message) {
+      if (!cbtBridgeFrame || !cbtBridgeFrame.contentWindow) {
+        throw new Error('Jembatan ke server belum tersedia.');
+      }
+      cbtBridgeFrame.contentWindow.postMessage(message, '*');
+    }
+
+    function cbtBridgeCall(method, args, successHandler, failureHandler) {
+      const id = 'cbt_' + Date.now() + '_' + (++cbtBridgeRequestNo);
+      const timer = setTimeout(() => {
+        const pending = cbtBridgePending.get(id);
+        if (!pending) return;
+        cbtBridgePending.delete(id);
+        if (typeof pending.failure === 'function') {
+          pending.failure({ message: 'Waktu tunggu server habis. Periksa koneksi internet lalu coba kembali.' });
+        }
+      }, 180000);
+
+      cbtBridgePending.set(id, { success: successHandler, failure: failureHandler, timer });
+      const message = { type: 'CBT_API_CALL', id, method, args };
+      if (cbtBridgeReady) {
+        try { cbtBridgeSend(message); }
+        catch (error) {
+          clearTimeout(timer);
+          cbtBridgePending.delete(id);
+          if (typeof failureHandler === 'function') failureHandler(error);
+        }
+      } else {
+        cbtBridgeQueue.push(message);
+      }
+    }
+
+    function cbtMakeScriptRunner(successHandler, failureHandler) {
+      const runnerBase = {
+        withSuccessHandler: function (fn) { return cbtMakeScriptRunner(fn, failureHandler); },
+        withFailureHandler: function (fn) { return cbtMakeScriptRunner(successHandler, fn); }
+      };
+      return new Proxy(runnerBase, {
+        get: function (target, property) {
+          if (property in target) return target[property];
+          if (property === 'then') return undefined;
+          if (typeof property !== 'string') return undefined;
+          return function () {
+            cbtBridgeCall(property, Array.prototype.slice.call(arguments), successHandler, failureHandler);
+          };
+        }
+      });
+    }
+
+    function initializeCbtApiBridge() {
+      const configuredUrl = String(CBT_GAS_WEB_APP_URL || '').trim();
+      if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:\?.*)?$/.test(configuredUrl)) {
+        serverMode = false;
+        return;
+      }
+
+      serverMode = true;
+      window.google = window.google || {};
+      window.google.script = window.google.script || {};
+      window.google.script.run = cbtMakeScriptRunner(null, null);
+
+      window.addEventListener('message', function (event) {
+        if (!cbtBridgeFrame || event.source !== cbtBridgeFrame.contentWindow) return;
+        const data = event.data || {};
+        if (data.type === 'CBT_BRIDGE_READY') {
+          cbtBridgeReady = true;
+          while (cbtBridgeQueue.length) {
+            const message = cbtBridgeQueue.shift();
+            try { cbtBridgeSend(message); }
+            catch (error) {
+              const pending = cbtBridgePending.get(message.id);
+              if (pending) {
+                clearTimeout(pending.timer);
+                cbtBridgePending.delete(message.id);
+                if (typeof pending.failure === 'function') pending.failure(error);
+              }
+            }
+          }
+          return;
+        }
+        if (data.type !== 'CBT_API_RESULT' || !data.id) return;
+        const pending = cbtBridgePending.get(data.id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        cbtBridgePending.delete(data.id);
+        if (data.ok) {
+          if (typeof pending.success === 'function') pending.success(data.result);
+        } else if (typeof pending.failure === 'function') {
+          pending.failure({ message: data.error || 'Terjadi kesalahan pada server.' });
+        }
+      });
+
+      const bridgeUrl = new URL(configuredUrl);
+      bridgeUrl.searchParams.set('bridge', '1');
+      cbtBridgeFrame = document.createElement('iframe');
+      cbtBridgeFrame.title = 'Koneksi layanan aplikasi';
+      cbtBridgeFrame.setAttribute('aria-hidden', 'true');
+      cbtBridgeFrame.tabIndex = -1;
+      cbtBridgeFrame.style.cssText = 'position:absolute;width:1px;height:1px;left:-10000px;top:-10000px;border:0;opacity:0;pointer-events:none;';
+      cbtBridgeFrame.src = bridgeUrl.toString();
+      document.body.appendChild(cbtBridgeFrame);
+    }
+
+    initializeCbtApiBridge();
 
     // Utilities
     function showToast(msg, type='success') {
